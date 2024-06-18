@@ -42,7 +42,8 @@ def fetch_bart_schedule():
     """Fetch the BART schedule from the API."""
     params = {
         'cmd': 'depart',
-        'orig': 'ALL',  # You may need to specify a particular origin
+        'orig': 'dbrk',
+        'dest': 'embr',
         'key': BART_API_KEY,
         'b': 0,
         'a': 24,  # Next 24 hours
@@ -55,6 +56,7 @@ def fetch_bart_schedule():
 def parse_schedule_data(data):
     """Parse the schedule data from the API response."""
     schedules = []
+    print(data)
     for schedule in data['root']['station']:
         for item in schedule['etd']:
             for estimate in item['estimate']:

@@ -1,63 +1,103 @@
 import requests
-import datetime
-import time
-import os
+import sqlite3
+from datetime import datetime, timedelta
 import json
+import os
 
-# Function to fetch BART schedule
+# Constants
+BART_API_URL = 'http://api.bart.gov/api/sched.aspx'
+BART_API_KEY = os.getenv('BART_API_KEY')
+DB_PATH = 'bart_schedule.db'
+
+def create_db():
+    """Create the database and table if it doesn't exist."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS schedules (
+            train_id TEXT PRIMARY KEY,
+            origin TEXT,
+            destination TEXT,
+            departure_time TEXT,
+            arrival_time TEXT,
+            UNIQUE(train_id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def get_existing_schedules():
+    """Get existing schedules from the database for the next 24 hours."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    next_24_hours = datetime.now() + timedelta(hours=24)
+    cursor.execute('''
+        SELECT * FROM schedules WHERE datetime(departure_time) < ?
+    ''', (next_24_hours,))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
 def fetch_bart_schedule():
-    # BART API endpoint
-    api_url = "http://api.bart.gov/api/sched.aspx"
-    
-    # Get the BART API key from the environment variable
-    api_key = os.getenv('BART_API_KEY')
-    if not api_key:
-        print("BART_API_KEY environment variable not set")
-        return
-    
-    # Parameters for the API request
+    """Fetch the BART schedule from the API."""
     params = {
-        'cmd': 'stnsched',
-        'orig': 'ALL',  # Get schedule for all stations
-        'date': 'today',
-        'key': api_key,
+        'cmd': 'depart',
+        'orig': 'ALL',  # You may need to specify a particular origin
+        'key': BART_API_KEY,
+        'b': 0,
+        'a': 24,  # Next 24 hours
         'json': 'y'
     }
-    
-    # Make the API request
-    response = requests.get(api_url, params=params)
-    
-    # Check if the request was successful
-    if response.status_code == 200:
-        # Parse the JSON response
-        schedule_data = response.json()
-        
-        # Save the schedule data to a file
-        filename = f"bart_schedule_{datetime.date.today()}.json"
-        with open(filename, 'w') as f:
-            json.dump(schedule_data, f, indent=4)
-        
-        print(f"Schedule data saved to {filename}")
-    else:
-        print("Failed to fetch schedule data")
+    response = requests.get(BART_API_URL, params=params)
+    data = response.json()
+    return data
 
-# Function to run the script at 1 AM daily
-def schedule_daily_task():
-    while True:
-        now = datetime.datetime.now()
-        target_time = now.replace(hour=1, minute=0, second=0, microsecond=0)
-        
-        # Calculate the time to sleep
-        sleep_time = (target_time - now).total_seconds()
-        
-        # If the target time has already passed today, schedule for tomorrow
-        if sleep_time < 0:
-            sleep_time += 86400  # Seconds in a day
-        
-        print(f"Sleeping for {sleep_time} seconds")
-        time.sleep(sleep_time)
-        
-        fetch_bart_schedule()
+def parse_schedule_data(data):
+    """Parse the schedule data from the API response."""
+    schedules = []
+    for schedule in data['root']['station']:
+        for item in schedule['etd']:
+            for estimate in item['estimate']:
+                schedules.append({
+                    'train_id': estimate['trainHeadStation'],
+                    'origin': schedule['name'],
+                    'destination': item['abbreviation'],
+                    'departure_time': estimate['minutes'],
+                    'arrival_time': estimate['length'],
+                })
+    return schedules
+
+def upsert_schedules(new_schedules):
+    """Upsert the new schedules into the database."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    for schedule in new_schedules:
+        cursor.execute('''
+            INSERT OR REPLACE INTO schedules (train_id, origin, destination, departure_time, arrival_time)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (schedule['train_id'], schedule['origin'], schedule['destination'],
+              schedule['departure_time'], schedule['arrival_time']))
+    conn.commit()
+    conn.close()
+
+def calculate_difference(existing, new):
+    """Calculate the difference between existing and new schedules."""
+    existing_set = set((row[0], row[1], row[2], row[3], row[4]) for row in existing)
+    new_set = set((item['train_id'], item['origin'], item['destination'], item['departure_time'], item['arrival_time']) for item in new)
+    difference = new_set - existing_set
+    return [dict(zip(['train_id', 'origin', 'destination', 'departure_time', 'arrival_time'], item)) for item in difference]
+
+def main():
+    create_db()
+    existing_schedules = get_existing_schedules()
+    api_response = fetch_bart_schedule()
+    new_schedules = parse_schedule_data(api_response)
+    difference = calculate_difference(existing_schedules, new_schedules)
+    if difference:
+        upsert_schedules(difference)
+        print(f"Upserted {len(difference)} new/updated schedules.")
+    else:
+        print("No new schedules to upsert.")
 
 if __name__ == "__main__":
-    schedule_daily_task()
+    main()
